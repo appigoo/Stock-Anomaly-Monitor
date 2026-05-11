@@ -141,6 +141,8 @@ def init_state():
         "check_interval":    60,
         "tg_mute":           False,
         "sent_alerts":       set(),
+        # EMA 狀態記錄：用於金叉「首次確認」去重（ticker → bool: 上次 EMA5 是否 > EMA10）
+        "prev_ema_above":    {},    # {ticker: True/False}
         # 訊號開關
         "sig_convergence":   True,
         "sig_golden":        True,
@@ -195,7 +197,7 @@ def calc_ema(series: pd.Series, period: int) -> pd.Series:
 
 # ── 資料抓取與指標計算 ────────────────────────────────────
 @st.cache_data(ttl=58)
-def fetch_stock(ticker: str, vol_period: int, ma_period: int, conv_pct: float):
+def fetch_stock(ticker: str, vol_period: int, ma_period: int, conv_pct: float, gap_vol_mult: float = 2.0):
     try:
         lookback = max(vol_period, ma_period, 200) + 10
         df = yf.download(ticker, period=f"{lookback}d", interval="1d",
@@ -238,7 +240,8 @@ def fetch_stock(ticker: str, vol_period: int, ma_period: int, conv_pct: float):
         ema_spread_pct = (max(e5_now, e10_now, e20_now) - min(e5_now, e10_now, e20_now)) / price_now * 100
         is_converging  = ema_spread_pct < conv_pct
 
-        # ── ② EMA5 金叉 EMA10 ──
+        # ── ② EMA5 金叉 EMA10（跨 K 棒判斷，由主迴圈覆寫）──
+        # 此處保留 intra-bar 初始值；主迴圈會用 prev_ema_above 做跨輪詢判斷
         golden_cross = (e5_prev <= e10_prev) and (e5_now > e10_now)
 
         # ── ③ 多頭排列 ──
@@ -268,8 +271,8 @@ def fetch_stock(ticker: str, vol_period: int, ma_period: int, conv_pct: float):
         else:
             gap_pct = 0.0
 
-        # 跳空 + 爆量組合（最強形態）
-        gap_with_vol = (gap_up or gap_down) and (vol_ratio >= 2.0)
+        # 跳空 + 爆量組合（最強形態）— 使用用戶設定的量比閾值
+        gap_with_vol = (gap_up or gap_down) and (vol_ratio >= gap_vol_mult)
 
         return {
             "ticker":         ticker,
@@ -485,8 +488,9 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
         if st.button("▶ 啟動", use_container_width=True, type="primary"):
-            st.session_state.monitoring  = True
-            st.session_state.sent_alerts = set()
+            st.session_state.monitoring    = True
+            st.session_state.sent_alerts   = set()
+            st.session_state.prev_ema_above = {}   # ← 重置金叉狀態，避免舊記憶誤判
     with c2:
         if st.button("⏹ 停止", use_container_width=True):
             st.session_state.monitoring = False
@@ -626,6 +630,7 @@ if st.session_state.monitoring:
             st.session_state.vol_period,
             st.session_state.ma_period,
             st.session_state.convergence_pct,
+            st.session_state.gap_vol_mult,      # ← 修正：傳入用戶設定值
         )
         if d:
             new_data[ticker] = d
@@ -635,10 +640,27 @@ if st.session_state.monitoring:
 
     st.session_state.last_data = new_data
 
+    # ── 跨輪詢金叉判斷（首次確認邏輯）────────────────────────
+    # 比較「上次輪詢時 EMA5 是否 > EMA10」與「本次」的狀態變化
+    # 只有從「否→是」的那一次才算金叉，避免多頭排列期間每輪詢都觸發
+    for ticker, d in new_data.items():
+        ema5_above_now = d["ema5"] > d["ema10"]
+        ema5_above_prev = st.session_state.prev_ema_above.get(ticker, ema5_above_now)
+        # 覆寫 fetch_stock 內的 golden_cross：只有「上次在下，這次在上」才算
+        d["golden_cross"] = (not ema5_above_prev) and ema5_above_now
+        # 更新狀態記錄
+        st.session_state.prev_ema_above[ticker] = ema5_above_now
+
     # 偵測警報（盤中才推 Telegram，避免閉市假訊號）
+    today_str = datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
     for ticker, d in new_data.items():
         for alert in check_alerts(d):
-            key = f"{ticker}_{alert['type']}_{alert['time'][:5]}"
+            # 跳空缺口是全天性質 → 用日期去重，防止整天洗版
+            # 其他訊號 → 用 HH:MM 去重（同分鐘只發一次）
+            if alert["type"] in ("gap_up", "gap_down"):
+                key = f"{ticker}_{alert['type']}_{today_str}"
+            else:
+                key = f"{ticker}_{alert['type']}_{alert['time'][:5]}"
             if key not in st.session_state.sent_alerts:
                 st.session_state.sent_alerts.add(key)
                 st.session_state.alert_log.append(alert)
